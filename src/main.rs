@@ -4,6 +4,8 @@ mod response;
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use threadpool::ThreadPool;
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -66,6 +68,10 @@ fn main() {
     }
     pretty_env_logger::init();
 
+    // Set up the threadpool
+    let n_workers = 8;
+    let pool = ThreadPool::new(n_workers);
+
     // Parse the command line arguments passed to this program
     let options = CmdOptions::parse();
     if options.upstream.len() < 1 {
@@ -90,15 +96,22 @@ fn main() {
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
     };
+
+    let shared_state = Arc::new(state);
+
     for stream in listener.incoming() {
         if let Ok(stream) = stream {
+            let shared_state_clone = shared_state.clone();
             // Handle the connection!
-            handle_connection(stream, &state);
+            pool.execute(move|| {
+                handle_connection(stream, shared_state_clone)
+            });
+            //handle_connection(stream, &shared_state);
         }
     }
 }
 
-fn connect_to_upstream(state: &ProxyState) -> Result<TcpStream, std::io::Error> {
+fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
     let mut rng = rand::rngs::StdRng::from_entropy();
     let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
     let upstream_ip = &state.upstream_addresses[upstream_idx];
@@ -118,7 +131,7 @@ fn send_response(client_conn: &mut TcpStream, response: &http::Response<Vec<u8>>
     }
 }
 
-fn handle_connection(mut client_conn: TcpStream, state: &ProxyState) {
+fn handle_connection(mut client_conn: TcpStream, state: Arc<ProxyState>) {
     let client_ip = client_conn.peer_addr().unwrap().ip().to_string();
     log::info!("Connection received from {}", client_ip);
 
