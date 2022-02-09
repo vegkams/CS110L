@@ -4,7 +4,9 @@ mod response;
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use tokio::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use tokio::sync::RwLock;
+use std::sync::Arc;
+use std::io::{Error, ErrorKind};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -55,7 +57,7 @@ struct ProxyState {
     #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
-    upstream_addresses: Vec<String>,
+    upstream_addresses: RwLock<Vec<String>>,
 }
 
 
@@ -88,7 +90,7 @@ async fn main() {
 
     // Handle incoming connections
     let state = ProxyState {
-        upstream_addresses: options.upstream,
+        upstream_addresses: RwLock::new(options.upstream),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         max_requests_per_minute: options.max_requests_per_minute,
@@ -111,13 +113,26 @@ async fn main() {
 }
 
 async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
-    let mut rng = rand::rngs::StdRng::from_entropy();
-    let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
-    let upstream_ip = &state.upstream_addresses[upstream_idx];
-    TcpStream::connect(upstream_ip).await.or_else(|err| {
-        log::error!("Failed to connect to upstream {}: {}", upstream_ip, err);
-        Err(err)
-    })
+    loop {
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let upstream_addresses_r = state.upstream_addresses.read().await;
+        let upstream_idx = rng.gen_range(0, upstream_addresses_r.len());
+        let upstream_ip = &upstream_addresses_r[upstream_idx];
+
+        match TcpStream::connect(upstream_ip).await {
+            Err(err) => { log::warn!("Failed to connect to upstream: {:?}", err);
+                          // Free the read lock
+                          drop(upstream_addresses_r);
+                          // Aquire a write lock
+                          let mut upstream_addresses_w = state.upstream_addresses.write().await;
+                          upstream_addresses_w.remove(upstream_idx);
+                          if upstream_addresses_w.is_empty() {
+                              return Err(std::io::Error::new(ErrorKind::Other, "All the upstream servers are down!"))
+                          }
+                        },
+            Ok(s) => return Ok(s),
+        }
+    }
     // TODO: implement failover (milestone 3)
 }
 
