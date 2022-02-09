@@ -53,6 +53,8 @@ struct ProxyState {
     /// Where we should send requests when doing active health checks (Milestone 4)
     #[allow(dead_code)]
     active_health_check_path: String,
+
+    upstreams_state: RwLock<UpstreamsState>,
     /// Maximum number of requests an individual IP can make in a minute (Milestone 5)
     #[allow(dead_code)]
     max_requests_per_minute: usize,
@@ -60,6 +62,41 @@ struct ProxyState {
     upstream_addresses: RwLock<Vec<String>>,
 }
 
+struct UpstreamsState {
+    num_upstreams: usize,
+    status: Vec<bool>,
+}
+
+impl UpstreamsState {
+    fn new(num_upstreams: usize) -> UpstreamsState {
+        UpstreamsState {
+            num_upstreams: num_upstreams,
+            status: vec![true; num_upstreams], 
+        }
+    }
+
+    fn is_alive(&self, idx: usize) -> bool {
+        self.status[idx]
+    }
+
+    fn all_dead(&self) -> bool {
+        self.num_upstreams == 0
+    }
+
+    fn set_dead(&mut self, idx: usize) {
+        if self.is_alive(idx) {
+            self.status[idx] = false;
+            self.num_upstreams -= 1;
+        }
+    }
+
+    fn set_alive(&mut self, idx: usize) {
+        if !self.is_alive(idx) {
+            self.status[idx] = true;
+            self.num_upstreams += 1;
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -88,11 +125,13 @@ async fn main() {
     };
     log::info!("Listening for requests on {}", options.bind);
 
+    let num_upstreams = options.upstream.len();
     // Handle incoming connections
     let state = ProxyState {
         upstream_addresses: RwLock::new(options.upstream),
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
+        upstreams_state: RwLock::new(UpstreamsState::new(num_upstreams)),
         max_requests_per_minute: options.max_requests_per_minute,
     };
 
@@ -111,6 +150,16 @@ async fn main() {
         }
     }
 }
+
+
+async fn active_health_check(state: Arc<ProxyState>) {
+
+}
+
+async fn check_server_status(state: Arc<ProxyState, idx: usize, path: &String>) -> Option<bool> {
+    
+}
+
 
 async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
     loop {
