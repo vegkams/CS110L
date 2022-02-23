@@ -5,6 +5,7 @@ use clap::Parser;
 use rand::{Rng, SeedableRng};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio::time::{delay_for, Duration};
 use std::sync::Arc;
 use std::io::{Error, ErrorKind};
 
@@ -59,7 +60,7 @@ struct ProxyState {
     #[allow(dead_code)]
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
-    upstream_addresses: RwLock<Vec<String>>,
+    upstream_addresses: Vec<String>,
 }
 
 struct UpstreamsState {
@@ -128,7 +129,7 @@ async fn main() {
     let num_upstreams = options.upstream.len();
     // Handle incoming connections
     let state = ProxyState {
-        upstream_addresses: RwLock::new(options.upstream),
+        upstream_addresses: options.upstream,
         active_health_check_interval: options.active_health_check_interval,
         active_health_check_path: options.active_health_check_path,
         upstreams_state: RwLock::new(UpstreamsState::new(num_upstreams)),
@@ -136,6 +137,12 @@ async fn main() {
     };
 
     let shared_state = Arc::new(state);
+
+    let shared_state_health_check = shared_state.clone();
+    tokio::spawn(async move {
+        active_health_check(shared_state_health_check).await
+    });
+
 
     loop {
         match listener.accept().await {
@@ -153,31 +160,66 @@ async fn main() {
 
 
 async fn active_health_check(state: Arc<ProxyState>) {
+    let path = &state.active_health_check_path;
+    let interval = state.active_health_check_interval as u64;
+    loop {
+        delay_for(Duration::from_secs(interval)).await;
+        let mut upstream_status = state.upstreams_state.write().await;
+        for idx in 0..state.upstream_addresses.len() {
+            if check_server_status(&state, idx, path).await.is_some() {
+                upstream_status.set_alive(idx);
+            }
+            else {
+                upstream_status.set_dead(idx);
+            }
+        }
+    }
 
 }
 
-async fn check_server_status(state: Arc<ProxyState, idx: usize, path: &String>) -> Option<bool> {
-    
+async fn check_server_status(state: &Arc<ProxyState>, idx: usize, path: &String) -> Option<bool> {
+    let ip = &state.upstream_addresses[idx];
+    match TcpStream::connect(ip).await {
+        Err(e) => None,
+        Ok(mut str) => {
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(path)
+                .header("Host", ip)
+                .body(Vec::new())
+                .unwrap();
+            let _ = request::write_to_stream(&req, &mut str).await.ok()?;
+            let res = response::read_from_stream(&mut str, &http::Method::GET).await.ok()?;
+            if res.status().as_u16() != 200 {
+                None
+            } else {
+                Some(true)
+            }
+        },
+    }
 }
 
 
 async fn connect_to_upstream(state: Arc<ProxyState>) -> Result<TcpStream, std::io::Error> {
     loop {
+        if state.upstreams_state.read().await.all_dead() {
+            return Err(std::io::Error::new(ErrorKind::Other, "All upstream servers are dead"));
+        }
+
         let mut rng = rand::rngs::StdRng::from_entropy();
-        let upstream_addresses_r = state.upstream_addresses.read().await;
-        let upstream_idx = rng.gen_range(0, upstream_addresses_r.len());
-        let upstream_ip = &upstream_addresses_r[upstream_idx];
+        let upstream_idx: usize = 0;
+        loop {
+            let upstream_idx = rng.gen_range(0, state.upstream_addresses.len());
+            if state.upstreams_state.read().await.is_alive(upstream_idx) {
+                break;
+            }
+        }
+        let upstream_ip = &state.upstream_addresses[upstream_idx];
 
         match TcpStream::connect(upstream_ip).await {
             Err(err) => { log::warn!("Failed to connect to upstream: {:?}", err);
-                          // Free the read lock
-                          drop(upstream_addresses_r);
-                          // Aquire a write lock
-                          let mut upstream_addresses_w = state.upstream_addresses.write().await;
-                          upstream_addresses_w.remove(upstream_idx);
-                          if upstream_addresses_w.is_empty() {
-                              return Err(std::io::Error::new(ErrorKind::Other, "All the upstream servers are down!"))
-                          }
+                          let mut upstream_status = state.upstreams_state.write().await;
+                          upstream_status.set_dead(upstream_idx);
                         },
             Ok(s) => return Ok(s),
         }
