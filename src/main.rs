@@ -1,13 +1,16 @@
 mod request;
 mod response;
+mod rate_limiter;
 
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::time::{delay_for, Duration};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::io::{Error, ErrorKind};
+use crate::rate_limiter::fixed_window::FixedWindow;
+use crate::rate_limiter::{RateLimiterAlgorithm, ArgRateLimiter};
 
 /// Contains information parsed from the command-line invocation of balancebeam. The Clap macros
 /// provide a fancy way to automatically construct a command-line argument parser.
@@ -41,6 +44,12 @@ struct CmdOptions {
         default_value = "0"
     )]
     max_requests_per_minute: usize,
+    #[clap(
+        arg_enum,
+        help = "The rate limit algorithm to apply (if max number of requests > 0)",
+        default_value = "fixed_window",
+    )]
+    rate_limiter: ArgRateLimiter,
 }
 
 /// Contains information about the state of balancebeam (e.g. what servers we are currently proxying
@@ -61,6 +70,8 @@ struct ProxyState {
     max_requests_per_minute: usize,
     /// Addresses of servers that we are proxying to
     upstream_addresses: Vec<String>,
+    /// Rate limiter
+    rate_limiter: Mutex<Box<dyn RateLimiterAlgorithm>>
 }
 
 struct UpstreamsState {
@@ -134,6 +145,7 @@ async fn main() {
         active_health_check_path: options.active_health_check_path,
         upstreams_state: RwLock::new(UpstreamsState::new(num_upstreams)),
         max_requests_per_minute: options.max_requests_per_minute,
+        rate_limiter: Mutex::new(create_rate_limiter(options.max_requests_per_minute, options.rate_limiter)),
     };
 
     let shared_state = Arc::new(state);
@@ -158,6 +170,17 @@ async fn main() {
     }
 }
 
+fn create_rate_limiter(limit: usize, limiter: ArgRateLimiter) -> Box<dyn RateLimiterAlgorithm> {
+    match limiter {
+        ArgRateLimiter::FixedWindow => {
+            Box::new(FixedWindow::new(limit))
+        }
+    }
+}
+
+fn update_rate_limiter(state: Arc<ProxyState>) {
+    
+}
 
 async fn active_health_check(state: Arc<ProxyState>) {
     let path = &state.active_health_check_path;
